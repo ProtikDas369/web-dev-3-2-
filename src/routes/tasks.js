@@ -1,77 +1,189 @@
+const logger = require('../config/logger');
+
+
+
 const express = require('express');
 const router = express.Router();
+const db = require('../config/db');
 
-// GET all tasks
-router.get('/', (req, res) => {
-  const tasks = req.app.locals.tasks;
-  res.status(200).json({
-    success: true,
-    data: tasks
-  });
-});
-
-// POST create new task
-router.post('/', (req, res) => {
+// ====================
+// GET ALL TASKS (Pagination + Search, exclude soft-deleted)
+// ====================
+router.get('/', async (req, res) => {
   try {
-    const { title, priority } = req.body;
+    let page = parseInt(req.query.page) || 1;
+    let limit = parseInt(req.query.limit) || 10;
+    if (limit > 50) limit = 50;
+    if (page < 1) page = 1;
+    const offset = (page - 1) * limit;
 
-    // validation
-    if (!title || !priority) {
-      return res.status(400).json({
-        success: false,
-        error: "Title and priority are required"
-      });
+    const search = req.query.q ? `%${req.query.q}%` : null;
+
+    let totalQuery = 'SELECT COUNT(*) as total FROM tasks WHERE deleted_at IS NULL';
+    let dataQuery = 'SELECT * FROM tasks WHERE deleted_at IS NULL';
+    let params = [];
+
+    if (search) {
+      totalQuery += ' AND title LIKE ?';
+      dataQuery += ' AND title LIKE ?';
+      params.push(search);
     }
 
-    const validPriorities = ["low", "medium", "high"];
-    if (!validPriorities.includes(priority)) {
-      return res.status(400).json({
-        success: false,
-        error: "Invalid priority. Use low, medium, or high"
-      });
-    }
+    const [countResult] = await db.query(totalQuery, params);
+    const totalTasks = countResult[0].total;
+    const totalPages = Math.ceil(totalTasks / limit);
 
-    const tasks = req.app.locals.tasks;  // FIXED: tasks must come from app.locals
+    dataQuery += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
 
-    const newTask = {
-      id: tasks.length + 1,
-      title,
-      completed: false,
-      priority,
-      createdAt: new Date()
-    };
+    const [rows] = await db.query(dataQuery, params);
 
-    tasks.push(newTask);
-
-    return res.status(201).json({
-      success: true,
-      data: newTask
+    res.json({
+      totalTasks,
+      totalPages,
+      currentPage: page,
+      limit,
+      data: rows
     });
 
   } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: "Internal server error"
-    });
+    logger.error(err.stack || err);;
+    res.status(500).json({ error: 'Database error' });
   }
 });
 
-// GET task by ID
-router.get('/:id', (req, res) => {
-  const id = req.params.id;
+// ====================
+// GET DELETED TASKS
+// ====================
+router.get('/deleted', async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT * FROM tasks WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC');
+    res.json(rows);
+  } catch (err) {
+    logger.error(err.stack || err);;
+    res.status(500).json({ error: 'Database error' });
+  }
+});
 
-  if (isNaN(id)) {
-    return res.status(400).json({ error: "Invalid ID format" });
+// ====================
+// CREATE TASK
+// ====================
+router.post('/', async (req, res) => {
+  const { title, description } = req.body;
+
+  if (!title || title.trim() === "") {
+    return res.status(400).json({ error: "Title is required" });
   }
 
-  const tasks = req.app.locals.tasks;
-  const task = tasks.find(t => t.id === Number(id));
+  try {
+    const sql = "INSERT INTO tasks (title, description) VALUES (?, ?)";
+    const [result] = await db.query(sql, [title, description || null]);
 
-  if (!task) {
-    return res.status(404).json({ error: "Task not found" });
+    const [newTask] = await db.query("SELECT * FROM tasks WHERE id = ?", [
+      result.insertId,
+    ]);
+
+    res.status(201).json(newTask[0]);
+  } catch (err) {
+    logger.error(err.stack || err);;
+    res.status(500).json({ error: "Failed to create task" });
   }
+});
 
-  res.status(200).json(task);
+// ====================
+// GET BY ID
+// ====================
+router.get('/:id', async (req, res) => {
+  try {
+    const [rows] = await db.query("SELECT * FROM tasks WHERE id = ? AND deleted_at IS NULL", [
+      req.params.id,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ====================
+// UPDATE TASK
+// ====================
+router.put('/:id', async (req, res) => {
+  const { title, description, status } = req.body;
+  const { id } = req.params;
+
+  try {
+    const updates = [];
+    const values = [];
+
+    if (title !== undefined) { updates.push("title = ?"); values.push(title); }
+    if (description !== undefined) { updates.push("description = ?"); values.push(description); }
+    if (status !== undefined) { updates.push("status = ?"); values.push(status); }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "No fields to update" });
+    }
+
+    values.push(id);
+
+    const sql = `UPDATE tasks SET ${updates.join(", ")} WHERE id = ? AND deleted_at IS NULL`;
+    const [result] = await db.query(sql, values);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Task not found or deleted" });
+    }
+
+    const [updated] = await db.query("SELECT * FROM tasks WHERE id = ?", [id]);
+    res.json(updated[0]);
+
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update task" });
+  }
+});
+
+// ====================
+// SOFT DELETE TASK
+// ====================
+router.delete('/:id', async (req, res) => {
+  try {
+    const [result] = await db.query(
+      "UPDATE tasks SET deleted_at = NOW() WHERE id = ? AND deleted_at IS NULL",
+      [req.params.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Task not found or already deleted" });
+    }
+
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete task" });
+  }
+});
+
+// ====================
+// RESTORE SOFT-DELETED TASK
+// ====================
+router.put('/:id/restore', async (req, res) => {
+  try {
+    const [result] = await db.query(
+      "UPDATE tasks SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+      [req.params.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Task not found or not deleted" });
+    }
+
+    const [restored] = await db.query("SELECT * FROM tasks WHERE id = ?", [req.params.id]);
+    res.json(restored[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to restore task" });
+  }
 });
 
 module.exports = router;
